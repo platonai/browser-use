@@ -14,9 +14,13 @@ api_key = os.getenv('DEEPSEEK_API_KEY', '')
 if not api_key:
 	raise ValueError('DEEPSEEK_API_KEY is not set')
 
-task="打开baidu.com，搜索框输入 PulsarRPA, 点击回车，搜索结果打开后，访问前三个网页，最后总结结果"
+task = """
+    go to https://www.amazon.com/s?k=best+selling+books+last+30+days
+    click on the dropdown menu on the top right corner that shows "Sort by: Featured"
+    then select "Best Sellers" from the dropdown
+    """
 
-async def run_search():
+async def run_agent():
 	agent = Agent(
 		task=task,
 		llm=ChatDeepSeek(
@@ -29,6 +33,5 @@ async def run_search():
 
 	await agent.run()
 
-
 if __name__ == '__main__':
-	asyncio.run(run_search())
+	asyncio.run(run_agent())
