@@ -10,6 +10,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from browser_use.llm.anthropic.chat import ChatAnthropic
+from browser_use.llm.google.chat import ChatGoogle
+from browser_use.llm.openai.chat import ChatOpenAI
+
 load_dotenv()
 
 try:
@@ -23,9 +27,6 @@ except ImportError:
 	print('⚠️ CLI addon is not installed. Please install it with: `pip install browser-use[cli]` and try again.')
 	sys.exit(1)
 
-import langchain_anthropic
-import langchain_google_genai
-import langchain_openai
 
 try:
 	import readline
@@ -196,27 +197,25 @@ def get_llm(config: dict[str, Any]):
 			if not CONFIG.OPENAI_API_KEY:
 				print('⚠️  OpenAI API key not found. Please update your config or set OPENAI_API_KEY environment variable.')
 				sys.exit(1)
-			return langchain_openai.ChatOpenAI(model=model_name, temperature=temperature)
+			return ChatOpenAI(model=model_name, temperature=temperature)
 		elif model_name.startswith('claude'):
 			if not CONFIG.ANTHROPIC_API_KEY:
 				print('⚠️  Anthropic API key not found. Please update your config or set ANTHROPIC_API_KEY environment variable.')
 				sys.exit(1)
-			return langchain_anthropic.ChatAnthropic(model_name=model_name, temperature=temperature, timeout=30, stop=None)
+			return ChatAnthropic(model=model_name, temperature=temperature)
 		elif model_name.startswith('gemini'):
 			if not CONFIG.GOOGLE_API_KEY:
 				print('⚠️  Google API key not found. Please update your config or set GOOGLE_API_KEY environment variable.')
 				sys.exit(1)
-			return langchain_google_genai.ChatGoogleGenerativeAI(model=model_name, temperature=temperature)
+			return ChatGoogle(model=model_name, temperature=temperature)
 
 	# Auto-detect based on available API keys
 	if CONFIG.OPENAI_API_KEY:
-		return langchain_openai.ChatOpenAI(model='gpt-4o', temperature=temperature)
+		return ChatOpenAI(model='gpt-4o', temperature=temperature)
 	elif CONFIG.ANTHROPIC_API_KEY:
-		return langchain_anthropic.ChatAnthropic(
-			model_name='claude-3.5-sonnet-exp', temperature=temperature, timeout=30, stop=None
-		)
+		return ChatAnthropic(model='claude-3.5-sonnet-exp', temperature=temperature)
 	elif CONFIG.GOOGLE_API_KEY:
-		return langchain_google_genai.ChatGoogleGenerativeAI(model='gemini-2.0-flash-lite', temperature=temperature)
+		return ChatGoogle(model='gemini-2.0-flash-lite', temperature=temperature)
 	else:
 		print(
 			'⚠️  No API keys found. Please update your config or set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY.'
@@ -485,7 +484,6 @@ class BrowserUseApp(App):
 			'playwright',
 			'urllib3',
 			'asyncio',
-			'langchain',
 			'openai',
 			'httpcore',
 			'charset_normalizer',
@@ -791,10 +789,9 @@ class BrowserUseApp(App):
 			if self.agent:
 				temp_str = f'{self.llm.temperature}ºC ' if self.llm.temperature else ''
 				vision_str = '+ vision ' if self.agent.settings.use_vision else ''
-				memory_str = '+ memory ' if self.agent.enable_memory else ''
 				planner_str = '+ planner' if self.agent.settings.planner_llm else ''
 				model_info.write(
-					f'[white]LLM:[/] [blue]{self.llm.__class__.__name__} [yellow]{model_name}[/] {temp_str}{vision_str}{memory_str}{planner_str}'
+					f'[white]LLM:[/] [blue]{self.llm.__class__.__name__} [yellow]{model_name}[/] {temp_str}{vision_str}{planner_str}'
 				)
 			else:
 				model_info.write(f'[white]LLM:[/] [blue]{self.llm.__class__.__name__} [yellow]{model_name}[/]')
@@ -802,28 +799,27 @@ class BrowserUseApp(App):
 			# Show token usage statistics if agent exists and has history
 			if self.agent and hasattr(self.agent, 'state') and hasattr(self.agent.state, 'history'):
 				# Get total tokens used
-				total_tokens = self.agent.state.history.total_input_tokens()
-				model_info.write(f'[white]Input tokens:[/] [green]{total_tokens:,}[/]')
+				# total_tokens = self.agent.state.history.total_input_tokens()
+				# model_info.write(f'[white]Input tokens:[/] [green]{total_tokens:,}[/]')
 
 				# Calculate tokens per step
 				num_steps = len(self.agent.state.history.history)
-				if num_steps > 0:
-					avg_tokens_per_step = total_tokens / num_steps
-					model_info.write(f'[white]Avg tokens/step:[/] [green]{avg_tokens_per_step:,.1f}[/]')
+				# if num_steps > 0:
+				# avg_tokens_per_step = total_tokens / num_steps
+				# model_info.write(f'[white]Avg tokens/step:[/] [green]{avg_tokens_per_step:,.1f}[/]')
 
-					# Get the last step metadata to show the most recent LLM response time
+				# Get the last step metadata to show the most recent LLM response time
 				if num_steps > 0 and self.agent.state.history.history[-1].metadata:
 					last_step = self.agent.state.history.history[-1]
 					if last_step.metadata:
 						step_duration = last_step.metadata.duration_seconds
-						step_tokens = last_step.metadata.input_tokens
 					else:
 						step_duration = 0
-						step_tokens = 0
+					# step_tokens = last_step.metadata.input_tokens
 
-					if step_tokens > 0:
-						tokens_per_second = step_tokens / step_duration if step_duration > 0 else 0
-						model_info.write(f'[white]Avg tokens/sec:[/] [magenta]{tokens_per_second:.1f}[/]')
+					# if step_tokens > 0:
+					# 	tokens_per_second = step_tokens / step_duration if step_duration > 0 else 0
+					# 	model_info.write(f'[white]Avg tokens/sec:[/] [magenta]{tokens_per_second:.1f}[/]')
 
 				# Show total duration
 				total_duration = self.agent.state.history.total_duration_seconds()
@@ -859,8 +855,8 @@ class BrowserUseApp(App):
 				# Extract original task(s)
 				original_tasks = []
 				for msg in message_history:
-					if hasattr(msg, 'message') and hasattr(msg.message, 'content'):
-						content = msg.message.content
+					if hasattr(msg, 'content'):
+						content = msg.content
 						if isinstance(content, str) and 'Your ultimate task is:' in content:
 							task_text = content.split('"""')[1].strip()
 							original_tasks.append(task_text)
@@ -901,13 +897,6 @@ class BrowserUseApp(App):
 
 						# Show goal if available
 						if item.model_output and hasattr(item.model_output, 'current_state'):
-							# Show memory (context) for this step
-							memory = item.model_output.current_state.memory
-							if memory:
-								memory_lines = memory.strip().split('\n')
-								memory_summary = memory_lines[0]
-								tasks_info.write(f'   [dim]Memory:[/] {memory_summary}')
-
 							# Show goal for this step
 							goal = item.model_output.current_state.next_goal
 							if goal:
@@ -1307,7 +1296,7 @@ async def textual_interface(config: dict[str, Any]):
 		# Log browser and model configuration that will be used
 		browser_type = 'Chromium'  # BrowserSession only supports Chromium
 		model_name = config.get('model', {}).get('name', 'auto-detected')
-		headless = config.get('browser', {}).get('headless', True)
+		headless = config.get('browser', {}).get('headless', False)
 		headless_str = 'headless' if headless else 'visible'
 
 		logger.info(f'Preparing {browser_type} browser ({headless_str}) with {model_name} LLM')
@@ -1418,7 +1407,7 @@ def main(ctx: click.Context, debug: bool = False, **kwargs):
 	# Log browser and model configuration that will be used
 	browser_type = 'Chromium'  # BrowserSession only supports Chromium
 	model_name = config.get('model', {}).get('name', 'auto-detected')
-	headless = config.get('browser', {}).get('headless', True)
+	headless = config.get('browser', {}).get('headless', False)
 	headless_str = 'headless' if headless else 'visible'
 
 	logger.info(f'Preparing {browser_type} browser ({headless_str}) with {model_name} LLM')

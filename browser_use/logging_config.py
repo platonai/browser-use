@@ -119,7 +119,6 @@ def setup_logging():
 		'playwright',
 		'urllib3',
 		'asyncio',
-		'langchain',
 		'langsmith',
 		'langsmith.client',
 		'openai',
@@ -129,10 +128,6 @@ def setup_logging():
 		'PIL.PngImagePlugin',
 		'trafilatura.htmlprocessing',
 		'trafilatura',
-		'mem0',
-		'mem0.vector_stores.faiss',
-		'mem0.vector_stores',
-		'mem0.memory',
 		'groq',
 	]
 	for logger_name in third_party_loggers:

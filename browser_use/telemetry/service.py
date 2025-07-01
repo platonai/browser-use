@@ -6,11 +6,12 @@ from dotenv import load_dotenv
 from posthog import Posthog
 from uuid_extensions import uuid7str
 
+from browser_use.telemetry.views import BaseTelemetryEvent
+from browser_use.utils import singleton
+
 load_dotenv()
 
 from browser_use.config import CONFIG
-from browser_use.telemetry.views import BaseTelemetryEvent
-from browser_use.utils import singleton
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +83,9 @@ class ProductTelemetry:
 
 		try:
 			self._posthog_client.capture(
-				self.user_id,
-				event.name,
-				{**event.properties, **POSTHOG_EVENT_SETTINGS},
+				distinct_id=self.user_id,
+				event=event.name,
+				properties={**event.properties, **POSTHOG_EVENT_SETTINGS},
 			)
 		except Exception as e:
 			logger.error(f'Failed to send telemetry event {event.name}: {e}')

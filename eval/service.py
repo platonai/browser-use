@@ -12,7 +12,7 @@
 # This is the LLM as a judge evaluation system from the OSU-NLP Group paper
 # Any adaptiations made should be explicitly stated here:
 # Adaptations:
-# We are using our langchain wrapper for the OpenAI API
+# We are using our own wrapper for the OpenAI API
 # This means we changed model.generate to model.invoke. The behavior of the model should be identical.
 # Added a Online_Mind2Web_eval_with_retry wrapper with retry logic in case of API rate limiting or other issues.
 
@@ -55,6 +55,13 @@ import anyio
 import psutil
 from lmnr import AsyncLaminarClient, Laminar, observe
 from PIL import Image
+from pydantic import BaseModel
+
+from browser_use.llm.anthropic.chat import ChatAnthropic
+from browser_use.llm.base import BaseChatModel
+from browser_use.llm.google.chat import ChatGoogle
+from browser_use.llm.openai.chat import ChatOpenAI
+from eval.utils import create_pydantic_model_from_schema
 
 MAX_IMAGE = 5
 
@@ -292,8 +299,8 @@ async def identify_key_points(task, model):
 			'content': [{'type': 'text', 'text': text}],
 		},
 	]
-	response = await asyncio.to_thread(model.invoke, messages)
-	return response.content
+	response = await model.ainvoke(messages)
+	return response.completion
 
 
 async def judge_image(task, image_path, key_points, model):
@@ -345,8 +352,8 @@ The snapshot of the web page is shown in the image."""
 			],
 		},
 	]
-	response = await asyncio.to_thread(model.invoke, messages)
-	return response.content
+	response = await model.ainvoke(messages)
+	return response.completion
 
 
 async def Online_Mind2Web_eval(task, last_actions, images_path, model, score_threshold):
@@ -574,6 +581,16 @@ class TaskResult:
 		# Add task execution data if available
 		if Stage.FORMAT_HISTORY in self.completed_stages:
 			format_data = self.stage_data.get(Stage.FORMAT_HISTORY, {})
+			logger.info(f'format_data: {format_data}')
+			# log token usage
+			logger.info(f'tokensUsed: {format_data.get("tokensUsed")}')
+			logger.info(f'usage: {format_data.get("usage")}')
+
+			# Handle usage data - convert to JSON string if it's a dict
+			usage_data = format_data.get('usage')
+			if usage_data and isinstance(usage_data, dict):
+				usage_data = json.dumps(usage_data)
+
 			payload.update(
 				{
 					'actionHistory': format_data.get('action_history', []),
@@ -584,6 +601,7 @@ class TaskResult:
 					'steps': format_data.get('steps'),
 					'maxSteps': self.max_steps,
 					'tokensUsed': format_data.get('tokensUsed'),
+					'usage': usage_data,  # Add usage data (JSON string if dict)
 					'completeHistory': format_data.get('complete_history', []),  # Add complete step history
 				}
 			)
@@ -622,7 +640,7 @@ class TaskResult:
 			# Handle legacy Mind2Web evaluation (for compatibility)
 			payload.update(
 				{
-					'onlineMind2WebEvaluationJudgement': eval_data.get('judgement'),
+					'onlineMind2WebEvaluationJudgement': eval_data.get('judgement') or 'No evaluation available',
 					'onlineMind2WebEvaluationError': eval_data.get('error'),
 					'onlineMind2WebEvaluationSuccess': eval_data.get('success', False),
 					'onlineMind2WebEvaluationScore': eval_data.get('score', 0.0),
@@ -651,14 +669,7 @@ class TaskResult:
 		}
 
 
-from langchain_anthropic import ChatAnthropic
-from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_openai import ChatOpenAI
-from pydantic.types import SecretStr
-
 from browser_use import ActionResult, Agent, BrowserProfile, BrowserSession, Controller
-from browser_use.agent.memory import MemoryConfig
 from browser_use.agent.views import AgentHistoryList
 
 SUPPORTED_MODELS = {
@@ -705,8 +716,8 @@ SUPPORTED_MODELS = {
 	'gemini-1.5-flash': {'provider': 'google', 'model_name': 'gemini-1.5-flash-latest', 'api_key_env': 'GEMINI_API_KEY'},
 	'gemini-2.0-flash-lite': {'provider': 'google', 'model_name': 'gemini-2.0-flash-lite', 'api_key_env': 'GEMINI_API_KEY'},
 	'gemini-2.0-flash': {'provider': 'google', 'model_name': 'gemini-2.0-flash', 'api_key_env': 'GEMINI_API_KEY'},
-	'gemini-2.5-pro': {'provider': 'google', 'model_name': 'gemini-2.5-pro-preview-03-25', 'api_key_env': 'GEMINI_API_KEY'},
-	'gemini-2.5-flash': {'provider': 'google', 'model_name': 'gemini-2.5-flash-latest', 'api_key_env': 'GEMINI_API_KEY'},
+	'gemini-2.5-pro': {'provider': 'google', 'model_name': 'gemini-2.5-pro', 'api_key_env': 'GEMINI_API_KEY'},
+	'gemini-2.5-flash': {'provider': 'google', 'model_name': 'gemini-2.5-flash', 'api_key_env': 'GEMINI_API_KEY'},
 	'gemini-2.5-pro-preview-05-06': {
 		'provider': 'google',
 		'model_name': 'gemini-2.5-pro-preview-05-06',
@@ -802,9 +813,9 @@ if not SERPER_API_KEY:
 	logger.warning('SERPER_API_KEY is not set. Search functionality will not be available.')
 
 
-def create_controller_with_serp_search():
+def create_controller_with_serp_search(output_model: type[BaseModel] | None = None):
 	"""Create a controller with SERP search instead of Google search"""
-	controller = Controller(exclude_actions=['search_google'])
+	controller = Controller(exclude_actions=['search_google'], output_model=output_model)
 
 	@controller.registry.action('Search the web for a specific query')
 	async def search_web(query: str):
@@ -842,16 +853,16 @@ def create_controller_with_serp_search():
 	return controller
 
 
-def create_controller(use_serp: bool = False):
+def create_controller(use_serp: bool = False, output_model: type[BaseModel] | None = None):
 	"""Create a controller, optionally with SERP search"""
 	if use_serp:
-		return create_controller_with_serp_search()
+		return create_controller_with_serp_search(output_model=output_model)
 	else:
-		return Controller()
+		return Controller(output_model=output_model)
 
 
 def get_llm(model_name: str):
-	"""Instantiates the correct LangChain ChatModel based on the model name."""
+	"""Instantiates the correct ChatModel based on the model name."""
 	if model_name not in SUPPORTED_MODELS:
 		raise ValueError(f'Unsupported model: {model_name}. Supported models are: {list(SUPPORTED_MODELS.keys())}')
 
@@ -866,30 +877,33 @@ def get_llm(model_name: str):
 		)
 		api_key = None
 
-	api_key_secret = SecretStr(api_key) if api_key else None
 	match provider:
 		case 'openai':
 			kwargs = {'model': config['model_name'], 'temperature': 0.0}
 			# Must set temperatue=1 if model is gpt-o4-mini
 			if model_name == 'gpt-o4-mini':
 				kwargs['temperature'] = 1
-			if api_key_secret:
-				kwargs['api_key'] = api_key_secret
+			if api_key:
+				kwargs['api_key'] = api_key
 			return ChatOpenAI(**kwargs)
 		case 'anthropic':
-			kwargs = {'model_name': config['model_name'], 'temperature': 0.0, 'timeout': 100, 'stop': None}
-			if api_key_secret:
-				kwargs['api_key'] = api_key_secret
+			kwargs = {
+				'model': config['model_name'],
+				'temperature': 0.0,
+				'timeout': 100,
+			}
+			if api_key:
+				kwargs['api_key'] = api_key
 			return ChatAnthropic(**kwargs)
 		case 'google':
 			kwargs = {'model': config['model_name'], 'temperature': 0.0}
-			if api_key_secret:
-				kwargs['api_key'] = api_key_secret
-			return ChatGoogleGenerativeAI(**kwargs)
+			if api_key:
+				kwargs['api_key'] = api_key
+			return ChatGoogle(**kwargs)
 		case 'openai_compatible':
 			kwargs = {'model': config['model_name'], 'base_url': config['base_url'], 'temperature': 0.0}
-			if api_key_secret:
-				kwargs['api_key'] = api_key_secret
+			if api_key:
+				kwargs['api_key'] = api_key
 			elif config.get('base_url'):
 				logger.warning(
 					f'API key for {model_name} at {config["base_url"]} is missing, but base_url is specified. Authentication may fail.'
@@ -929,6 +943,7 @@ async def reformat_agent_history(
 	task_id: str,
 	run_id: str,
 	task: str,
+	last_message: str,
 	base_path: str = 'saved_trajectories',
 	include_result: bool = False,
 ) -> dict:
@@ -1023,6 +1038,16 @@ async def reformat_agent_history(
 	if include_result and final_result and final_result.strip():
 		action_history = action_history + [final_result]
 
+	# Extract usage data from agent history
+	usage_data = None
+	logger.info(f'Agent history usage object: {agent_history.usage}')
+	logger.info(f'Agent history usage type: {type(agent_history.usage)}')
+	if hasattr(agent_history, 'usage') and agent_history.usage:
+		logger.info(f'Agent history usage model_dump: {agent_history.usage.model_dump()}')
+		usage_data = agent_history.usage.model_dump()
+	else:
+		logger.warning('Agent history has no usage data or usage is empty/None')
+
 	# Create results structure with new fields
 	results = {
 		'task_id': task_id,
@@ -1031,12 +1056,14 @@ async def reformat_agent_history(
 		'action_history': action_history,
 		'screenshot_paths': screenshot_paths,
 		'final_result_response': final_result,
+		'last_message': last_message,
 		'self_report_completed': self_report_completed,
 		'self_report_success': self_report_success,
 		'complete_history': complete_history,
 		'task_duration': task_duration,
 		'steps': len(complete_history),
 		'tokensUsed': total_tokens_used,  # Add total tokens used
+		'usage': usage_data,  # Add usage data
 	}
 
 	# Save results file
@@ -1069,9 +1096,24 @@ class Task:
 		self.login_cookie = kwargs.get('login_cookie', None)
 		self.login_type = kwargs.get('login_type', None)
 		self.category = kwargs.get('category', None)
+		self.output_schema = kwargs.get('output_schema', None)  # Add structured output schema support
+		if self.output_schema:
+			# Convert JSON schema to Pydantic model class
+			self.output_model = create_pydantic_model_from_schema(self.output_schema, f'Task_{self.task_id}_Output')
+		else:
+			self.output_model = None
 
 		# Store any additional optional fields
-		known_fields = {'website', 'reference_length', 'level', 'cluster_id', 'login_cookie', 'login_type', 'category'}
+		known_fields = {
+			'website',
+			'reference_length',
+			'level',
+			'cluster_id',
+			'login_cookie',
+			'login_type',
+			'category',
+			'output_schema',
+		}
 		self.additional_fields = {k: v for k, v in kwargs.items() if k not in known_fields}
 
 		# Make all additional fields accessible as attributes
@@ -1080,7 +1122,7 @@ class Task:
 
 	def __str__(self):
 		# Include main fields and indicate if there are additional fields
-		base_str = f'Task(task_id={self.task_id}, confirmed_task={self.confirmed_task}, website={self.website}, reference_length={self.reference_length}, level={self.level}, cluster_id={self.cluster_id}, login_cookie={self.login_cookie}, login_type={self.login_type}, category={self.category}'
+		base_str = f'Task(task_id={self.task_id}, confirmed_task={self.confirmed_task}, website={self.website}, reference_length={self.reference_length}, level={self.level}, cluster_id={self.cluster_id}, login_cookie={self.login_cookie}, login_type={self.login_type}, category={self.category}, output_schema={self.output_schema}'
 		if self.additional_fields:
 			additional_str = ', '.join(f'{k}={v}' for k, v in self.additional_fields.items())
 			base_str += f', {additional_str}'
@@ -1107,7 +1149,13 @@ async def judge_task_result(model, task_folder: Path, score_threshold: float = 3
 	"""
 	result_file = task_folder / 'result.json'
 	if not result_file.exists():
-		return {'task_id': task_folder.name, 'judgement': None, 'success': False, 'error': 'No result.json found', 'score': 0.0}
+		return {
+			'task_id': task_folder.name,
+			'judgement': 'No result.json found',
+			'success': False,
+			'error': 'No result.json found',
+			'score': 0.0,
+		}
 
 	try:
 		async with await anyio.open_file(result_file) as f:
@@ -1138,9 +1186,9 @@ async def judge_task_result(model, task_folder: Path, score_threshold: float = 3
 
 				messages, text, system_msg, record, key_points = eval_result
 
-				# Final steps to get judgement - run invoke in a thread
-				judgement_msg = await asyncio.to_thread(model.invoke, messages)
-				judgement = judgement_msg.content
+				# Final steps to get judgement - use async invoke directly
+				judgement_response = await model.ainvoke(messages)
+				judgement = judgement_response.completion
 
 				if 'success' in judgement.lower().split('status:')[1]:  # This is the official criteria for success
 					evaluation = {
@@ -1169,7 +1217,7 @@ async def judge_task_result(model, task_folder: Path, score_threshold: float = 3
 			except Exception as err:
 				return {
 					'task_id': task_folder.name,
-					'judgement': None,
+					'judgement': f'Mind2Web evaluation failed: {type(err).__name__}: {err}',
 					'success': False,
 					'error': f'{type(err).__name__}: {err}',
 					'score': 0.0,
@@ -1198,14 +1246,15 @@ async def judge_task_result(model, task_folder: Path, score_threshold: float = 3
 
 			try:
 				# Run comprehensive judge evaluation
-				comprehensive_result = await evaluate_task_with_comprehensive_judge(
-					task_folder=task_folder, model=model, max_images=10
+				comprehensive_result = await asyncio.wait_for(
+					evaluate_task_with_comprehensive_judge(task_folder=task_folder, model=model, max_images=10),
+					timeout=180,  # 3 minutes max for evaluation
 				)
 
 				if comprehensive_result.get('error'):
 					return {
 						'task_id': task_folder.name,
-						'judgement': None,
+						'judgement': f'Comprehensive evaluation failed: {comprehensive_result["error"]}',
 						'success': False,
 						'error': comprehensive_result['error'],
 						'score': 0.0,
@@ -1224,7 +1273,7 @@ async def judge_task_result(model, task_folder: Path, score_threshold: float = 3
 				else:
 					return {
 						'task_id': task_folder.name,
-						'judgement': None,
+						'judgement': 'Comprehensive judge failed to return results',
 						'success': False,
 						'error': 'Comprehensive judge failed to return results',
 						'score': 0.0,
@@ -1234,7 +1283,7 @@ async def judge_task_result(model, task_folder: Path, score_threshold: float = 3
 				logger.error(f'Comprehensive judge evaluation failed for {task_folder.name}: {err}')
 				return {
 					'task_id': task_folder.name,
-					'judgement': None,
+					'judgement': f'Comprehensive judge error: {type(err).__name__}: {err}',
 					'success': False,
 					'error': f'Comprehensive judge error: {type(err).__name__}: {err}',
 					'score': 0.0,
@@ -1243,7 +1292,7 @@ async def judge_task_result(model, task_folder: Path, score_threshold: float = 3
 	except Exception as err:
 		return {
 			'task_id': task_folder.name,
-			'judgement': None,
+			'judgement': f'Evaluation failed: {type(err).__name__}: {err}',
 			'success': False,
 			'error': f'{type(err).__name__}: {err}',
 			'score': 0.0,
@@ -1262,12 +1311,12 @@ async def setup_browser_session(task: Task, headless: bool, highlight_elements: 
 	logger.debug(f'Browser setup: Initializing BrowserSession for task {task.task_id}')
 
 	# Use incognito mode (user_data_dir=None) for evaluations to avoid state pollution
-	profile = BrowserProfile(
-		user_data_dir=None,  # Incognito mode - no persistent state
-		headless=headless,
-		chromium_sandbox=False,  # running in docker
-		highlight_elements=highlight_elements,  # Control element highlighting (passed to profile)
-		keep_alive=True,
+	profile_kwargs = {
+		'user_data_dir': None,  # Incognito mode - no persistent state
+		'headless': headless,
+		'chromium_sandbox': False,  # running in docker
+		'highlight_elements': highlight_elements,  # Control element highlighting (passed to profile)
+		'keep_alive': True,
 		# higher timeouts = higher success rates on long tail of slow sites or if on a slow CI server
 		# timeout=60_000,
 		# default_timeout=60_000,
@@ -1276,8 +1325,24 @@ async def setup_browser_session(task: Task, headless: bool, highlight_elements: 
 		# maximum_wait_page_load_time=60.0,
 		# wait_between_actions=0.5,
 		# ignore_https_errors=True,  # some eval tasks have http:// or broken https sites in them
-	)
+	}
 
+	if hasattr(task, 'login_cookie') and task.login_cookie:
+		# For login tasks, configure storage_state to save cookies to JSON file
+		# This works even in incognito mode (user_data_dir=None)
+		task_folder = Path(f'saved_trajectories/{task.task_id}')
+		task_folder.mkdir(parents=True, exist_ok=True)
+
+		storage_state_path = task_folder / 'storage_state.json'
+		profile_kwargs['storage_state'] = str(storage_state_path)
+
+		downloads_dir_path = task_folder / 'downloads'
+		downloads_dir_path.mkdir(parents=True, exist_ok=True)
+		profile_kwargs['downloads_path'] = str(downloads_dir_path)
+
+		logger.debug(f'Login task {task.task_id}: Configured to save cookies to {storage_state_path}')
+
+	profile = BrowserProfile(**profile_kwargs)
 	browser_session = BrowserSession(browser_profile=profile)
 
 	# Start browser session
@@ -1308,15 +1373,19 @@ async def run_agent_with_browser(
 	validate_output: bool = False,
 	planner_llm: BaseChatModel | None = None,
 	planner_interval: int = 1,
-) -> AgentHistoryList:
+	use_thinking: bool = True,
+) -> tuple[AgentHistoryList, str]:
 	"""Run agent with the browser session"""
-	# Create controller, optionally with SERP search
-	controller = create_controller(use_serp=use_serp)
+	# Create controller, optionally with SERP search and structured output
+	controller = create_controller(use_serp=use_serp, output_model=task.output_model)
 
-	# Configure memory if enabled
-	memory_config = None
+	# Check for deprecated memory parameters
 	if enable_memory:
-		memory_config = MemoryConfig(agent_id=f'eval_agent_{task.task_id}', memory_interval=memory_interval, llm_instance=llm)
+		raise ValueError(
+			'Memory support has been removed as of version 0.3.2. '
+			'The agent context for memory is significantly improved and no longer requires the old memory system. '
+			"Please remove the 'enable_memory' parameter."
+		)
 
 	agent = Agent(
 		task=task.confirmed_task,
@@ -1324,23 +1393,145 @@ async def run_agent_with_browser(
 		controller=controller,
 		browser_session=browser_session,
 		use_vision=use_vision,
-		enable_memory=enable_memory,
-		memory_config=memory_config,
 		max_actions_per_step=max_actions_per_step,
 		validate_output=validate_output,
 		planner_llm=planner_llm,
 		planner_interval=planner_interval,
+		use_thinking=use_thinking,
 		source='eval_platform',
+		calculate_cost=True,
 	)
-
+	# get last message
 	await agent.run(max_steps=max_steps)
-	return agent.state.history
+	last_input_messages = agent.message_manager.last_input_messages
+	last_message = last_input_messages[-1].text
+	return agent.state.history, last_message
 
 
 @observe(name='evaluate_task_result', span_type='EVALUATOR')  # type: ignore[arg-type]
-async def evaluate_task_result(eval_model: BaseChatModel, task_folder: Path, use_mind2web: bool = False) -> dict:
+async def evaluate_task_result(
+	eval_model: BaseChatModel, task_folder: Path, task: Task | None = None, use_mind2web: bool = False
+) -> dict:
 	"""Evaluate the task result"""
-	return await judge_task_result(eval_model, task_folder, score_threshold=3, use_mind2web=use_mind2web)
+	# Check if this is a login task that should use cookie-based evaluation
+	if task and hasattr(task, 'login_cookie') and task.login_cookie:
+		logger.info(f'Using cookie-based evaluation for login task {task.task_id}')
+		return await evaluate_task_with_login_cookie(task.login_cookie, task_folder)
+	else:
+		return await judge_task_result(eval_model, task_folder, score_threshold=3, use_mind2web=use_mind2web)
+
+
+async def evaluate_task_with_login_cookie(login_cookie: str, task_folder: Path) -> dict:
+	"""
+	Evaluate a login task by checking if the login_cookie is present in browser cookies.
+
+	Args:
+		login_cookie: String identifier that should appear in cookies if login was successful
+		task_folder: Path to the task result folder containing saved cookies
+
+	Returns:
+		Dictionary containing evaluation results similar to Online_Mind2Web_eval format
+	"""
+	# Look for cookies in saved_trajectories (saved by browser-use during shutdown)
+	cookies_file = task_folder / 'cookies.json'
+	storage_state_file = task_folder / 'storage_state.json'
+
+	cookies_data = None
+	cookies_source = None
+
+	# Try to load cookies from storage_state.json first (newer format)
+	if storage_state_file.exists():
+		try:
+			async with await anyio.open_file(storage_state_file) as f:
+				storage_state = json.loads(await f.read())
+				cookies_data = storage_state.get('cookies', [])
+				cookies_source = 'storage_state.json'
+		except Exception as e:
+			logger.warning(f'Failed to load storage_state.json: {e}')
+
+	# Fallback to cookies.json (older format)
+	if not cookies_data and cookies_file.exists():
+		try:
+			async with await anyio.open_file(cookies_file) as f:
+				cookies_data = json.loads(await f.read())
+				cookies_source = 'cookies.json'
+		except Exception as e:
+			logger.warning(f'Failed to load cookies.json: {e}')
+
+	if not cookies_data:
+		return {
+			'task_id': task_folder.name,
+			'judgement': 'Automatic judgement: No cookies saved for evaluation',
+			'success': False,
+			'error': 'No cookies file found for login task evaluation',
+			'score': 0.0,
+		}
+
+	logger.debug(f'Found {len(cookies_data)} cookies from {cookies_source}')
+
+	# Check if this is an exact match requirement
+	if login_cookie.startswith('EXACTMATCH '):
+		# Extract the actual cookie name after "EXACTMATCH "
+		exact_cookie_name = login_cookie[11:]  # Remove "EXACTMATCH " prefix
+		is_exact_match = True
+		search_target = exact_cookie_name
+		logger.debug(f"Using exact match for cookie name: '{exact_cookie_name}'")
+	else:
+		# Use substring matching (original behavior)
+		is_exact_match = False
+		search_target = login_cookie
+		logger.debug(f"Using substring matching for: '{login_cookie}'")
+
+	# Check if login_cookie is present in cookies
+	login_cookie_found = False
+	matching_cookie_info = None
+
+	for cookie in cookies_data:
+		cookie_name = cookie.get('name', '')
+		cookie_value = cookie.get('value', '')
+
+		if is_exact_match:
+			# Exact match: check if cookie name exactly matches the target
+			if cookie_name == search_target:
+				login_cookie_found = True
+				matching_cookie_info = f"exact name match='{cookie_name}'"
+				logger.debug(f'Login cookie found with exact match: {matching_cookie_info}')
+				break
+		else:
+			# Substring match: check if target appears in cookie name or value
+			if search_target in cookie_name or search_target in cookie_value:
+				login_cookie_found = True
+				matching_cookie_info = f"substring match in name='{cookie_name}'"
+				logger.debug(f'Login cookie found with substring match: {matching_cookie_info}')
+				break
+
+	# Prepare evaluation result
+	if login_cookie_found:
+		if is_exact_match:
+			judgement = f"Automatic judgement: Login cookie '{search_target}' was found as exact match in browser cookies"
+		else:
+			judgement = f"Automatic judgement: Login cookie '{search_target}' was found in browser cookies"
+		success = True
+		score = 1.0
+		error = None
+	else:
+		if is_exact_match:
+			judgement = f"Automatic judgement: Login cookie '{search_target}' was NOT found as exact match in browser cookies"
+		else:
+			judgement = f"Automatic judgement: Login cookie '{search_target}' was NOT found in browser cookies"
+		success = False
+		score = 0.0
+		error = None
+
+	logger.info(f"Cookie evaluation result: success={success} for login_cookie='{login_cookie}'")
+
+	return {
+		'task_id': task_folder.name,
+		'judgement': judgement,
+		'success': success,
+		'error': error,
+		'score': score,
+	}
 
 
 def save_result_to_server(convex_url: str, secret_key: str, payload: dict) -> bool:
@@ -1400,6 +1591,7 @@ async def run_task_with_semaphore(
 	include_result: bool = False,
 	highlight_elements: bool = True,
 	use_mind2web_judge: bool = False,
+	use_thinking: bool = True,
 ) -> dict:
 	"""Clean pipeline approach for running tasks"""
 	task_start_time = time.time()
@@ -1487,7 +1679,7 @@ async def run_task_with_semaphore(
 					try:
 						logger.info(f'Task {task.task_id}: Agent run starting.')
 
-						agent_history = await run_stage(
+						agent_history, last_message = await run_stage(
 							Stage.RUN_AGENT,
 							lambda: run_agent_with_browser(
 								browser_session,
@@ -1502,6 +1694,7 @@ async def run_task_with_semaphore(
 								validate_output,
 								planner_llm,
 								planner_interval,
+								use_thinking,
 							),
 							timeout=1000,
 						)
@@ -1511,7 +1704,8 @@ async def run_task_with_semaphore(
 					except Exception as e:
 						error = StageError(Stage.RUN_AGENT, 'exception', str(e))
 						task_result.stage_failed(Stage.RUN_AGENT, error)
-						logger.error(f'Task {task.task_id}: Agent run failed: {str(e)}')
+						logger.error(f'Task {task.task_id}: Agent run failed: {str(e) + " " + str(e.__traceback__)}')
+
 						# Continue to server save instead of early return
 
 				# Stage 3: Format history
@@ -1521,7 +1715,12 @@ async def run_task_with_semaphore(
 						formatted_data = await run_stage(
 							Stage.FORMAT_HISTORY,
 							lambda: reformat_agent_history(
-								agent_history, task.task_id, run_id, task.confirmed_task, include_result=include_result
+								agent_history,
+								task.task_id,
+								run_id,
+								task.confirmed_task,
+								last_message,
+								include_result=include_result,
 							),
 						)
 						task_result.stage_completed(Stage.FORMAT_HISTORY, formatted_data)
@@ -1537,7 +1736,9 @@ async def run_task_with_semaphore(
 					try:
 						logger.info(f'Task {task.task_id}: Evaluation starting.')
 						evaluation = await run_stage(
-							Stage.EVALUATE, lambda: evaluate_task_result(eval_model, task_folder, use_mind2web_judge), timeout=300
+							Stage.EVALUATE,
+							lambda: evaluate_task_result(eval_model, task_folder, task, use_mind2web_judge),
+							timeout=300,
 						)
 						task_result.stage_completed(Stage.EVALUATE, evaluation)
 						logger.info(f'Task {task.task_id}: Evaluation completed.')
@@ -1558,15 +1759,21 @@ async def run_task_with_semaphore(
 				# Stage 5: Save to server (always attempt)
 				try:
 					logger.info(f'Task {task.task_id}: Saving result to server.')
-					await run_stage(
-						Stage.SAVE_SERVER,
-						lambda: asyncio.to_thread(
-							save_result_to_server, convex_url, secret_key, task_result.server_payload if task_result else {}
-						),
-						timeout=60,
-					)
-					task_result.stage_completed(Stage.SAVE_SERVER)
-					logger.info(f'Task {task.task_id}: Successfully saved result to server.')
+					# Only save to server if URLs are provided (skip for single task mode)
+					if convex_url and secret_key:
+						await run_stage(
+							Stage.SAVE_SERVER,
+							lambda: asyncio.to_thread(
+								save_result_to_server, convex_url, secret_key, task_result.server_payload if task_result else {}
+							),
+							timeout=60,
+						)
+						task_result.stage_completed(Stage.SAVE_SERVER)
+						logger.info(f'Task {task.task_id}: Successfully saved result to server.')
+					else:
+						# Single task mode - skip server save but mark as completed
+						logger.info(f'Task {task.task_id}: Skipping server save (single task mode)')
+						task_result.stage_completed(Stage.SAVE_SERVER)
 				except Exception as e:
 					error = StageError(Stage.SAVE_SERVER, 'exception', str(e))
 					task_result.stage_failed(Stage.SAVE_SERVER, error)
@@ -1716,6 +1923,7 @@ async def run_multiple_tasks(
 	include_result: bool = False,
 	highlight_elements: bool = True,
 	use_mind2web_judge: bool = False,
+	use_thinking: bool = True,
 ) -> dict:
 	"""
 	Run multiple tasks in parallel and evaluate results.
@@ -1793,6 +2001,7 @@ async def run_multiple_tasks(
 					include_result=include_result,
 					highlight_elements=highlight_elements,
 					use_mind2web_judge=use_mind2web_judge,
+					use_thinking=use_thinking,
 				)
 				for task in tasks_to_run
 			),
@@ -1932,7 +2141,7 @@ def get_git_info():
 		}
 
 
-# Helper function to start a new run on the server
+# Helper function to start a new run on the convex server
 def start_new_run(convex_url: str, secret_key: str, run_details: dict, existing_run_id: str | None = None):
 	"""Sends a request to start a new evaluation run and returns the run ID."""
 	if not convex_url or not secret_key:
@@ -2061,6 +2270,7 @@ async def run_evaluation_pipeline(
 	laminar_eval_id: str | None = None,
 	highlight_elements: bool = True,
 	use_mind2web_judge: bool = False,
+	use_thinking: bool = True,
 ) -> dict:
 	"""
 	Complete evaluation pipeline that handles Laminar setup and task execution in the same event loop
@@ -2111,6 +2321,7 @@ async def run_evaluation_pipeline(
 		include_result=include_result,
 		highlight_elements=highlight_elements,
 		use_mind2web_judge=use_mind2web_judge,
+		use_thinking=use_thinking,
 	)
 
 
@@ -2174,6 +2385,14 @@ if __name__ == '__main__':
 		help='Existing Laminar evaluation ID to use (if not provided, a new evaluation will be created)',
 	)
 	parser.add_argument('--use-mind2web-judge', action='store_true', help='Use original judge')
+	parser.add_argument('--no-thinking', action='store_true', help='Disable thinking in agent system prompt')
+	parser.add_argument('--use-anchor', action='store_true', help='Use anchor to navigate to the page')
+
+	# Single task mode arguments
+	parser.add_argument('--task-text', type=str, default=None, help='Task description for single task mode')
+	parser.add_argument('--task-website', type=str, default=None, help='Task website for single task mode')
+	# Keep task-id for backward compatibility but make it optional
+	parser.add_argument('--task-id', type=str, default=None, help='Optional task ID (auto-generated if not provided)')
 
 	args = parser.parse_args()
 
@@ -2185,30 +2404,51 @@ if __name__ == '__main__':
 	# Run tasks and evaluate
 	load_dotenv()
 
-	# --- Fetch Tasks from Server ---
-	CONVEX_URL = os.getenv('EVALUATION_TOOL_URL')
-	SECRET_KEY = os.getenv('EVALUATION_TOOL_SECRET_KEY')
+	# --- Load Environment Variables (Always) ---
+	CONVEX_URL = os.getenv('EVALUATION_TOOL_URL') or ''
+	SECRET_KEY = os.getenv('EVALUATION_TOOL_SECRET_KEY') or ''
 
-	if not CONVEX_URL or not SECRET_KEY:
-		logger.error('Error: EVALUATION_TOOL_URL or EVALUATION_TOOL_SECRET_KEY environment variables not set.')
-		exit(1)  # Exit if config is missing
+	# --- Load Tasks (Either Single Task or from Server) ---
+	tasks = []
+	task_id = None  # Initialize for proper scoping
 
-	logger.info(f"Attempting to fetch task list '{args.test_case}' from server...")
-	fetched_task_data = fetch_tasks_from_server(CONVEX_URL, SECRET_KEY, args.test_case)
+	# Check if this is single task mode
+	if args.task_text:
+		# Generate task ID if not provided
+		task_id = args.task_id or f'single_task_{int(time.time())}_{hash(args.task_text) % 10000}'
+		logger.info(f'Single task mode: Running task {task_id}')
 
-	if fetched_task_data is None:
-		logger.error('Failed to fetch tasks from the server. Exiting.')
-		exit(1)  # Exit if fetch fails
-
-	try:
-		tasks = [Task(**task_data) for task_data in fetched_task_data]
-		logger.info(f'Successfully loaded {len(tasks)} tasks from the server.')
-	except (TypeError, ValueError) as e:
-		logger.error(
-			f'Error creating Task objects from fetched data. Ensure the data structure includes required fields (task_id, confirmed_task). Known optional fields: website, reference_length, level, cluster_id, login_cookie, login_type, category. Any additional fields will be accepted dynamically. Error: {type(e).__name__}: {e}'
+		# Create a single task
+		single_task = Task(
+			task_id=task_id,
+			confirmed_task=args.task_text,
+			website=args.task_website,  # Optional website
 		)
-		logger.error(f'First item in fetched data: {fetched_task_data[0] if fetched_task_data else "None"}')
-		exit(1)
+		tasks = [single_task]
+		logger.info(f'Single task mode: Created task {task_id}')
+
+	else:
+		# Original multi-task mode - fetch from server
+		if not CONVEX_URL or not SECRET_KEY:
+			logger.error('Error: EVALUATION_TOOL_URL or EVALUATION_TOOL_SECRET_KEY environment variables not set.')
+			exit(1)  # Exit if config is missing
+
+		logger.info(f"Attempting to fetch task list '{args.test_case}' from server...")
+		fetched_task_data = fetch_tasks_from_server(CONVEX_URL, SECRET_KEY, args.test_case)
+
+		if fetched_task_data is None:
+			logger.error('Failed to fetch tasks from the server. Exiting.')
+			exit(1)  # Exit if fetch fails
+
+		try:
+			tasks = [Task(**task_data) for task_data in fetched_task_data]
+			logger.info(f'Successfully loaded {len(tasks)} tasks from the server.')
+		except (TypeError, ValueError) as e:
+			logger.error(
+				f'Error creating Task objects from fetched data. Ensure the data structure includes required fields (task_id, confirmed_task). Known optional fields: website, reference_length, level, cluster_id, login_cookie, login_type, category. Any additional fields will be accepted dynamically. Error: {type(e).__name__}: {e}'
+			)
+			logger.error(f'First item in fetched data: {fetched_task_data[0] if fetched_task_data else "None"}')
+			exit(1)
 	# -----------------------------
 
 	# --- Start Run on Server (with optional existing Run ID) ---
@@ -2217,6 +2457,7 @@ if __name__ == '__main__':
 	else:
 		logger.info('Attempting to start a new run on the server...')
 
+	# Get git info
 	git_info = get_git_info()
 
 	# Collect additional data from args to store with the run
@@ -2248,17 +2489,30 @@ if __name__ == '__main__':
 		'userMessage': args.user_message,
 		'evalGroup': args.eval_group,
 		'developerId': args.developer_id,
-		'totalTasks': len(tasks) - args.start if args.end is None else args.end - args.start,
+		'totalTasks': 1 if args.task_text else (len(tasks) - args.start if args.end is None else args.end - args.start),
 		'testCaseName': args.test_case,
 		'additionalData': additional_run_data,
 		'laminarEvalLink': None,  # Will be updated after evaluation creation
 	}
 
-	run_id = start_new_run(CONVEX_URL, SECRET_KEY, run_data, existing_run_id=args.run_id)
+	# For single task mode, use provided run ID if available, otherwise skip server run creation
+	if args.task_text:
+		# Single task mode - use provided run_id (from GitHub Actions) or generate local one
+		if args.run_id:
+			run_id = args.run_id
+			logger.info(f'Single task mode: Using provided run ID {run_id}')
+		else:
+			# Fallback for local single task runs without server
+			safe_task_id = task_id or 'unknown'
+			run_id = f'local_single_task_{safe_task_id}_{int(time.time())}'
+			logger.info(f'Single task mode: Using local run ID {run_id}')
+	else:
+		# Multi-task mode - use server
+		run_id = start_new_run(CONVEX_URL, SECRET_KEY, run_data, existing_run_id=args.run_id)
 
-	if not run_id:
-		logger.error('Failed to start/initialize run on the server. Exiting.')
-		exit(1)
+		if not run_id:
+			logger.error('Failed to start/initialize run on the server. Exiting.')
+			exit(1)
 
 	logger.info(f'Successfully obtained run ID: {run_id}. Proceeding with tasks...')
 
@@ -2331,6 +2585,24 @@ if __name__ == '__main__':
 	logger.info('🔧 EVALUATION STARTUP')
 	log_system_resources('STARTUP')
 
+	# For single task mode, set appropriate start/end indices and parallel runs
+	if args.task_text:
+		# Single task mode - force single execution but SAVE results to server
+		start_index = 0
+		end_index = 1
+		parallel_runs = 1
+		# Use server URLs for single task mode too so results are saved and visible
+		convex_url = CONVEX_URL if CONVEX_URL else ''
+		secret_key = SECRET_KEY if SECRET_KEY else ''
+		logger.info('Single task mode: Running single task with parallel_runs=1')
+	else:
+		# Multi-task mode - use provided arguments
+		start_index = args.start
+		end_index = args.end
+		parallel_runs = args.parallel_runs
+		convex_url = CONVEX_URL
+		secret_key = SECRET_KEY
+
 	try:
 		results = asyncio.run(
 			run_evaluation_pipeline(
@@ -2339,13 +2611,13 @@ if __name__ == '__main__':
 				run_id=run_id,
 				test_case=args.test_case,
 				user_message=args.user_message,
-				convex_url=CONVEX_URL,
-				secret_key=SECRET_KEY,
+				convex_url=convex_url,
+				secret_key=secret_key,
 				eval_model=eval_model,
-				max_parallel_runs=args.parallel_runs,
+				max_parallel_runs=parallel_runs,
 				max_steps_per_task=args.max_steps,
-				start_index=args.start,
-				end_index=args.end,
+				start_index=start_index,
+				end_index=end_index,
 				headless=args.headless,
 				use_vision=not args.no_vision,
 				use_serp=args.use_serp,
@@ -2359,6 +2631,7 @@ if __name__ == '__main__':
 				laminar_eval_id=args.laminar_eval_id,
 				highlight_elements=args.highlight_elements,
 				use_mind2web_judge=args.use_mind2web_judge,
+				use_thinking=not args.no_thinking,
 			)
 		)
 
