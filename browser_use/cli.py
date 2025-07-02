@@ -191,6 +191,8 @@ def get_llm(config: dict[str, Any]):
 		os.environ['ANTHROPIC_API_KEY'] = api_keys['anthropic']
 	if api_keys.get('google') and not CONFIG.GOOGLE_API_KEY:
 		os.environ['GOOGLE_API_KEY'] = api_keys['google']
+	if api_keys.get('deepseek') and not CONFIG.DEEPSEEK_API_KEY:
+		os.environ['DEEPSEEK_API_KEY'] = api_keys['deepseek']
 
 	if model_name:
 		if model_name.startswith('gpt'):
@@ -208,6 +210,12 @@ def get_llm(config: dict[str, Any]):
 				print('⚠️  Google API key not found. Please update your config or set GOOGLE_API_KEY environment variable.')
 				sys.exit(1)
 			return ChatGoogle(model=model_name, temperature=temperature)
+		elif model_name.startswith('deepseek'):
+			if not CONFIG.DEEPSEEK_API_KEY:
+				print('⚠️  DeepSeek API key not found. Please update your config or set DEEPSEEK_API_KEY environment variable.')
+				sys.exit(1)
+			# Use OpenAI-compatible API endpoint for DeepSeek
+			return ChatOpenAI(model=model_name, temperature=temperature, base_url='https://api.deepseek.com/v1', api_key=CONFIG.DEEPSEEK_API_KEY)
 
 	# Auto-detect based on available API keys
 	if CONFIG.OPENAI_API_KEY:
@@ -216,9 +224,11 @@ def get_llm(config: dict[str, Any]):
 		return ChatAnthropic(model='claude-3.5-sonnet-exp', temperature=temperature)
 	elif CONFIG.GOOGLE_API_KEY:
 		return ChatGoogle(model='gemini-2.0-flash-lite', temperature=temperature)
+	elif CONFIG.DEEPSEEK_API_KEY:
+		return ChatOpenAI(model='deepseek-chat', temperature=temperature, base_url='https://api.deepseek.com/v1', api_key=CONFIG.DEEPSEEK_API_KEY)
 	else:
 		print(
-			'⚠️  No API keys found. Please update your config or set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY.'
+			'⚠️  No API keys found. Please update your config or set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY, or DEEPSEEK_API_KEY.'
 		)
 		sys.exit(1)
 

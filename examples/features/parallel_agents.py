@@ -22,7 +22,6 @@ browser_session = BrowserSession(
 )
 llm = ChatOpenAI(model='gpt-4o')
 
-
 async def main():
 	await browser_session.start()
 	agents = [
